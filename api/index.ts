@@ -21,7 +21,7 @@ export function buildApp() {
     // CORS — restrict to frontend origin
     const allowedOrigins = [
         process.env.FRONTEND_URL,
-        "http://localhost:8080",
+        "https://field-investigation-tracker.vercel.app",
         "http://192.168.100.4:8080", // Local network access
     ].filter(Boolean) as string[];
 
