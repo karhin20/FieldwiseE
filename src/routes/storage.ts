@@ -1,155 +1,127 @@
 import { FastifyInstance } from "fastify";
-import { supabase } from "../lib/supabase";
-import { createClient } from "@supabase/supabase-js";
+import cloudinary from "../lib/cloudinary";
 import { authenticate } from "../middleware/auth";
-
-const BUCKET = "investigation-photos";
-// Signed URLs expire after 24 hours (86400 seconds)
-const SIGNED_URL_EXPIRY = 86400;
 
 export async function storageRoutes(app: FastifyInstance) {
     /**
      * POST /api/storage/upload
-     * Upload a photo to Supabase Storage.
+     * Upload a photo to Cloudinary.
      * Accepts base64-encoded image data.
-     * Returns the file path (for DB storage) and a signed URL (for immediate display).
+     * Returns the public_id (as filePath) and the secure_url.
      */
     app.post(
         "/api/storage/upload",
         { preHandler: [authenticate] },
         async (request, reply) => {
             const user = request.user!;
-            const { base64, fileName, contentType } = request.body as {
+            const { base64, contentType } = request.body as {
                 base64: string;
                 fileName: string;
                 contentType: string;
             };
 
-            if (!base64 || !fileName || !contentType) {
-                return reply.code(400).send({ error: "Missing base64, fileName, or contentType" });
+            if (!base64 || !contentType) {
+                return reply.code(400).send({ error: "Missing base64 or contentType" });
             }
 
             // Validate content type
             const allowedTypes = ["image/jpeg", "image/png", "image/heic", "image/webp"];
             if (!allowedTypes.includes(contentType)) {
-                return reply.code(400).send({ error: `Unsupported file type: ${contentType}. Allowed: ${allowedTypes.join(", ")}` });
+                return reply.code(400).send({ error: `Unsupported file type: ${contentType}` });
             }
 
-            // Strip data URI prefix if present (e.g. "data:image/jpeg;base64,...")
-            const cleanBase64 = base64.includes(",") ? base64.split(",")[1] : base64;
-
-            // Convert to Buffer
-            const buffer = Buffer.from(cleanBase64, "base64");
-
-            // Max 10MB
-            if (buffer.length > 10 * 1024 * 1024) {
-                return reply.code(400).send({ error: "File too large. Maximum size is 10MB." });
-            }
-
-            // Build unique file path: userId/timestamp-filename
-            const sanitizedName = fileName.replace(/[^a-zA-Z0-9._-]/g, "_");
-            const filePath = `${user.id}/${Date.now()}-${sanitizedName}`;
-
-            // Upload to Supabase Storage
-            const { error: uploadError } = await supabase.storage
-                .from(BUCKET)
-                .upload(filePath, buffer, {
-                    contentType,
-                    upsert: false,
+            try {
+                // Upload to Cloudinary
+                // We pass the base64 string directly (with data URI prefix if present)
+                const uploadResult = await cloudinary.uploader.upload(base64, {
+                    folder: `field_investigations/${user.id}`,
+                    resource_type: "image",
+                    // Optional: auto-optimization on upload
+                    quality: "auto",
+                    fetch_format: "auto"
                 });
 
-            if (uploadError) {
-                console.error("Storage upload error:", uploadError);
-                return reply.code(500).send({ error: "Failed to upload file" });
+                return reply.code(201).send({
+                    filePath: uploadResult.public_id, // We store public_id in the DB
+                    signedUrl: uploadResult.secure_url, // For immediate display
+                });
+            } catch (error) {
+                console.error("Cloudinary upload error:", error);
+                return reply.code(500).send({ error: "Failed to upload to Cloudinary" });
             }
-
-            // Generate a signed URL for immediate access
-            const { data: signedData, error: signError } = await supabase.storage
-                .from(BUCKET)
-                .createSignedUrl(filePath, SIGNED_URL_EXPIRY);
-
-            if (signError) {
-                console.error("Signed URL error:", signError);
-                return reply.code(500).send({ error: "File uploaded but failed to generate URL" });
-            }
-
-            return reply.code(201).send({
-                filePath,
-                signedUrl: signedData.signedUrl,
-            });
         }
     );
 
     /**
      * DELETE /api/storage/delete
-     * Remove a photo from Supabase Storage.
+     * Remove a photo from Cloudinary.
      */
     app.delete(
         "/api/storage/delete",
         { preHandler: [authenticate] },
         async (request, reply) => {
             const user = request.user!;
-            const { filePath } = request.body as { filePath: string };
+            const { filePath: publicId } = request.body as { filePath: string };
 
-            if (!filePath) {
-                return reply.code(400).send({ error: "Missing filePath" });
+            if (!publicId) {
+                return reply.code(400).send({ error: "Missing publicId" });
             }
 
             // Security: field investigators can only delete their own files
-            if (user.role === "field_investigator" && !filePath.startsWith(`${user.id}/`)) {
+            // (Assuming folder structure field_investigations/{user.id}/...)
+            if (user.role === "field_investigator" && !publicId.startsWith(`field_investigations/${user.id}/`)) {
                 return reply.code(403).send({ error: "You can only delete your own files" });
             }
 
-            const { error } = await supabase.storage
-                .from(BUCKET)
-                .remove([filePath]);
-
-            if (error) {
-                console.error("Storage delete error:", error);
-                return reply.code(500).send({ error: "Failed to delete file" });
+            try {
+                const result = await cloudinary.uploader.destroy(publicId);
+                if (result.result !== "ok") {
+                    console.error("Cloudinary delete result not ok:", result);
+                    // Return 200 anyway if it was already deleted or not found
+                }
+                return reply.send({ message: "File deleted successfully" });
+            } catch (error) {
+                console.error("Cloudinary delete error:", error);
+                return reply.code(500).send({ error: "Failed to delete from Cloudinary" });
             }
-
-            return reply.send({ message: "File deleted successfully" });
         }
     );
 
     /**
      * POST /api/storage/signed-url
-     * Generate a fresh signed URL for an existing file.
-     * Used when displaying photos in the UI (since signed URLs expire).
+     * Get the URL for a Cloudinary public_id.
+     * With Cloudinary, we can return the direct URL or a transformed version.
      */
     app.post(
         "/api/storage/signed-url",
         { preHandler: [authenticate] },
         async (request, reply) => {
-            const { filePath } = request.body as { filePath: string };
+            const { filePath: publicId } = request.body as { filePath: string };
 
-            if (!filePath) {
-                return reply.code(400).send({ error: "Missing filePath" });
+            if (!publicId) {
+                return reply.code(400).send({ error: "Missing publicId" });
             }
 
+            // If it's a full URL already (legacy or external), just return it
+            if (publicId.startsWith("http")) {
+                return reply.send({ signedUrl: publicId });
+            }
 
             try {
-                // Create a fresh Supabase client to avoid stale singleton state
-                // that causes "Object not found" errors on subsequent requests
-                const freshClient = createClient(
-                    process.env.SUPABASE_URL!,
-                    process.env.SUPABASE_SERVICE_ROLE_KEY!,
-                    { auth: { autoRefreshToken: false, persistSession: false } }
-                );
+                // Generate a secure URL. Since Cloudinary URLs are permanent, 
+                // we don't need a "signed" URL for standard public uploads.
+                // We can also apply transformations here (e.g. sharpening for meter reading)
+                const url = cloudinary.url(publicId, {
+                    secure: true,
+                    quality: "auto",
+                    fetch_format: "auto",
+                    // Example transformation: sharpen for better text legibility
+                    effect: "sharpen:100"
+                });
 
-                const { data, error } = await freshClient.storage
-                    .from(BUCKET)
-                    .createSignedUrl(filePath, SIGNED_URL_EXPIRY);
-
-                if (error) {
-                    console.error(`[STORAGE ERROR] createSignedUrl failed for "${filePath}":`, JSON.stringify(error, null, 2));
-                    return reply.send({ signedUrl: null });
-                }
-
-                return reply.send({ signedUrl: data.signedUrl });
+                return reply.send({ signedUrl: url });
             } catch (err: any) {
-                console.error(`[STORAGE EXCEPTION] Unexpected error for "${filePath}":`, err.message);
+                console.error(`[CLOUDINARY ERROR] url generation failed for "${publicId}":`, err.message);
                 return reply.send({ signedUrl: null });
             }
         }

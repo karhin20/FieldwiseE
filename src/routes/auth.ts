@@ -1,10 +1,14 @@
 import { FastifyInstance } from "fastify";
 import jwt from "jsonwebtoken";
+import { createClient } from "@supabase/supabase-js";
 import { supabase } from "../lib/supabase";
 import { signupSchema, signinSchema } from "../schemas/auth";
 import { authenticate } from "../middleware/auth";
 
-const JWT_SECRET = process.env.JWT_SECRET || "";
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+    throw new Error("JWT_SECRET environment variable is required");
+}
 
 export async function authRoutes(app: FastifyInstance) {
     /**
@@ -22,6 +26,25 @@ export async function authRoutes(app: FastifyInstance) {
         }
 
         const { email, password, fullName, role } = parsed.data;
+
+        // Security: Prevent unauthorized signups (Outsiders)
+        const clientSecret = request.headers["x-signup-secret"];
+
+        if (role === "manager") {
+            if (clientSecret !== process.env.ADMIN_SIGNUP_SECRET) {
+                return reply.code(403).send({
+                    error: "Unauthorized",
+                    message: "Invalid manager signup secret."
+                });
+            }
+        } else if (role === "field_investigator") {
+            if (clientSecret !== process.env.WORKER_SIGNUP_SECRET) {
+                return reply.code(403).send({
+                    error: "Unauthorized",
+                    message: "Invalid worker signup secret."
+                });
+            }
+        }
 
         // Create user in Supabase Auth
         const { data: authData, error: authError } =
@@ -75,9 +98,15 @@ export async function authRoutes(app: FastifyInstance) {
 
         const { email, password } = parsed.data;
 
-        // Authenticate via Supabase Auth
+        // Authenticate via Supabase Auth using a disposable client
+        // so we don't pollute the shared service-role client's session state
+        const tempClient = createClient(
+            process.env.SUPABASE_URL!,
+            process.env.SUPABASE_SERVICE_ROLE_KEY!,
+            { auth: { autoRefreshToken: false, persistSession: false } }
+        );
         const { data: authData, error: authError } =
-            await supabase.auth.signInWithPassword({ email, password });
+            await tempClient.auth.signInWithPassword({ email, password });
 
         if (authError) {
             return reply.code(401).send({ error: "Invalid email or password" });
@@ -104,7 +133,7 @@ export async function authRoutes(app: FastifyInstance) {
                 role: profile.role,
                 fullName: profile.full_name,
             },
-            JWT_SECRET,
+            JWT_SECRET!,
             { expiresIn: "7d" }
         );
 

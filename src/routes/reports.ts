@@ -1,5 +1,6 @@
 import { FastifyInstance } from "fastify";
 import { supabase } from "../lib/supabase";
+import cloudinary from "../lib/cloudinary";
 import { createReportSchema } from "../schemas/reports";
 import { authenticate, requireRole } from "../middleware/auth";
 
@@ -74,9 +75,13 @@ export async function reportRoutes(app: FastifyInstance) {
             const limit = Math.min(100, Math.max(1, parseInt(query.limit || "50", 10) || 50));
             const offset = (page - 1) * limit;
 
+            // Only fetch fields needed for the list view to save bandwidth
             let dbQuery = supabase
                 .from("investigation_reports")
-                .select("*", { count: "exact" })
+                .select(
+                    "id, account_name, account_number, existing_service_category, irregularities, officer_name, district, created_at, action_taken, meter_replaced_or_new, photo_url",
+                    { count: "exact" }
+                )
                 .order("created_at", { ascending: false })
                 .range(offset, offset + limit - 1);
 
@@ -127,173 +132,32 @@ export async function reportRoutes(app: FastifyInstance) {
                 dateTo?: string;
             };
 
-            let dbQuery = supabase
-                .from("investigation_reports")
-                .select("region, district, officer_name, irregularities, existing_service_category, meter_replaced_or_new, action_taken, created_at, latitude, longitude");
-
-            // Role-based scoping
-            if (user.role === "field_investigator") {
-                dbQuery = dbQuery.eq("user_id", user.id);
-            }
-
-            // Apply Filters
-            if (query.district && query.district !== "all") dbQuery = dbQuery.eq("district", query.district);
-            if (query.officer && query.officer !== "all") dbQuery = dbQuery.eq("officer_name", query.officer);
-            if (query.category && query.category !== "all") dbQuery = dbQuery.eq("existing_service_category", query.category);
-            if (query.irregularity && query.irregularity !== "all") dbQuery = dbQuery.contains("irregularities", [query.irregularity]);
-
-            if (query.dateFrom) {
-                dbQuery = dbQuery.gte("created_at", query.dateFrom);
-            }
-            if (query.dateTo) {
-                // Ensure dateTo includes the whole day
-                const end = new Date(query.dateTo);
+            // Fix dateTo to included the full day
+            let dateToFormatted = query.dateTo || null;
+            if (dateToFormatted) {
+                const end = new Date(dateToFormatted);
                 end.setUTCHours(23, 59, 59, 999);
-                dbQuery = dbQuery.lte("created_at", end.toISOString());
+                dateToFormatted = end.toISOString();
             }
 
-            const { data: reports, error } = await dbQuery;
+            // Call the optimized Postgres function
+            const { data: stats, error } = await supabase.rpc("get_dashboard_stats", {
+                p_user_role: user.role,
+                p_user_id: user.id,
+                p_district: query.district || "all",
+                p_officer: query.officer || "all",
+                p_category: query.category || "all",
+                p_irregularity: query.irregularity || "all",
+                p_date_from: query.dateFrom || null,
+                p_date_to: dateToFormatted,
+            });
 
             if (error) {
-                console.error("Stats fetch error:", error);
-                return reply.code(500).send({ error: "Failed to fetch stats" });
+                console.error("Stats RPC error:", error);
+                return reply.code(500).send({ error: "Failed to calculate statistics" });
             }
 
-            if (!reports || reports.length === 0) {
-                return reply.send({
-                    totalReports: 0,
-                    activeRegions: 0,
-                    topIrregularity: null,
-                    pieData: [],
-                    barData: [],
-                    categoryData: [],
-                    trendData: [],
-                    stackedData: [],
-                    officerLeaderboard: [],
-                    kpis: {
-                        totalIrregularities: 0,
-                        metersReplaced: 0,
-                        replacementRate: 0,
-                        avgIrrPerReport: "0",
-                        escalatedCases: 0,
-                        topDistrict: "—"
-                    }
-                });
-            }
-
-            // Aggregations
-            const uniqueRegions = new Set(reports.map(r => r.region).filter(Boolean));
-            const districtCounts: Record<string, number> = {};
-            const irregularityCounts: Record<string, number> = {};
-            const categoryCounts: Record<string, number> = {};
-            const officerStats: Record<string, { reports: number; irregularities: number; metersReplaced: number }> = {};
-            const trendMap: Record<string, number> = {};
-            const irrByDistrict: Record<string, Record<string, number>> = {};
-            const hotspots: Array<{ lat: number; lng: number; hasIrregularity: boolean }> = [];
-
-            let metersReplaced = 0;
-            let escalatedCases = 0;
-
-            reports.forEach(r => {
-                // Districts
-                districtCounts[r.district] = (districtCounts[r.district] || 0) + 1;
-
-                // Categories
-                categoryCounts[r.existing_service_category] = (categoryCounts[r.existing_service_category] || 0) + 1;
-
-                // Irregularities
-                if (Array.isArray(r.irregularities)) {
-                    r.irregularities.forEach((irr: string) => {
-                        irregularityCounts[irr] = (irregularityCounts[irr] || 0) + 1;
-
-                        if (!irrByDistrict[r.district]) irrByDistrict[r.district] = {};
-                        irrByDistrict[r.district][irr] = (irrByDistrict[r.district][irr] || 0) + 1;
-                    });
-                }
-
-                // Officers
-                if (!officerStats[r.officer_name]) {
-                    officerStats[r.officer_name] = { reports: 0, irregularities: 0, metersReplaced: 0 };
-                }
-                officerStats[r.officer_name].reports += 1;
-                officerStats[r.officer_name].irregularities += (r.irregularities?.length || 0);
-                if (r.meter_replaced_or_new) {
-                    officerStats[r.officer_name].metersReplaced += 1;
-                    metersReplaced += 1;
-                }
-
-                // KPIs
-                if (r.action_taken?.toLowerCase().includes("escalat")) escalatedCases += 1;
-
-                // Trend (group by day like Dec 1)
-                const date = new Date(r.created_at);
-                const dayKey = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-                trendMap[dayKey] = (trendMap[dayKey] || 0) + 1;
-
-                // Hotspots
-                if (r.latitude && r.longitude) {
-                    hotspots.push({
-                        lat: r.latitude,
-                        lng: r.longitude,
-                        hasIrregularity: (r.irregularities?.length || 0) > 0
-                    });
-                }
-            });
-
-            // Format Pie Data
-            const pieData = Object.entries(irregularityCounts)
-                .map(([name, value]) => ({ name, value }))
-                .sort((a, b) => b.value - a.value);
-
-            // Format Bar Data
-            const barData = Object.entries(districtCounts)
-                .map(([name, count]) => ({ name, count }))
-                .sort((a, b) => b.count - a.count);
-
-            // Format Category Data
-            const categoryData = Object.entries(categoryCounts)
-                .map(([name, value]) => ({ name, value }))
-                .sort((a, b) => b.value - a.value);
-
-            // Format Officer Leaderboard
-            const officerLeaderboard = Object.entries(officerStats)
-                .map(([name, s]) => ({ name, ...s }))
-                .sort((a, b) => b.reports - a.reports);
-
-            // Format Trend Data (last 14 days)
-            const trendData = Object.entries(trendMap)
-                .map(([date, count]) => ({ date, count }))
-                .slice(-14);
-
-            // Format Stacked Data
-            const topIrrTypes = pieData.slice(0, 5).map(p => p.name);
-            const stackedData = Object.entries(irrByDistrict).map(([district, irrs]) => ({
-                district: district.replace("Accra ", ""),
-                ...irrs,
-            }));
-
-            const totalIrregularities = Object.values(irregularityCounts).reduce((a, b) => a + b, 0);
-
-            return reply.send({
-                totalReports: reports.length,
-                activeRegions: uniqueRegions.size,
-                topIrregularity: pieData[0]?.name || null,
-                pieData,
-                barData,
-                categoryData,
-                trendData,
-                stackedData,
-                officerLeaderboard,
-                hotspots,
-                kpis: {
-                    totalIrregularities,
-                    metersReplaced,
-                    replacementRate: Math.round((metersReplaced / reports.length) * 100),
-                    avgIrrPerReport: (totalIrregularities / reports.length).toFixed(1),
-                    escalatedCases,
-                    topDistrict: barData[0]?.name ?? "—"
-                }
-            });
+            return reply.send(stats);
         }
     );
 
@@ -379,11 +243,15 @@ export async function reportRoutes(app: FastifyInstance) {
 
             const data = parsed.data;
 
-            // If photo changed and old one was a storage path, delete old file
+            // If photo changed and old one was a storage path, delete old file from Cloudinary
             if (existing.photo_url && data.photoUrl !== existing.photo_url) {
                 const oldPath = existing.photo_url;
-                if (oldPath && !oldPath.startsWith("data:") && !oldPath.startsWith("http") && oldPath.length < 500) {
-                    await supabase.storage.from("investigation-photos").remove([oldPath]);
+                if (oldPath && !oldPath.startsWith("http") && !oldPath.startsWith("data:") && oldPath.includes("/")) {
+                    try {
+                        await cloudinary.uploader.destroy(oldPath);
+                    } catch (err) {
+                        console.error("Cleanup error (Cloudinary):", err);
+                    }
                 }
             }
 
@@ -451,9 +319,13 @@ export async function reportRoutes(app: FastifyInstance) {
                 return reply.code(403).send({ error: "Edit window has expired" });
             }
 
-            // Delete associated photo from storage
-            if (existing.photo_url && !existing.photo_url.startsWith("data:") && !existing.photo_url.startsWith("http") && existing.photo_url.length < 500) {
-                await supabase.storage.from("investigation-photos").remove([existing.photo_url]);
+            // Delete associated photo from Cloudinary
+            if (existing.photo_url && !existing.photo_url.startsWith("http") && !existing.photo_url.startsWith("data:") && existing.photo_url.includes("/")) {
+                try {
+                    await cloudinary.uploader.destroy(existing.photo_url);
+                } catch (err) {
+                    console.error("Cleanup error on delete (Cloudinary):", err);
+                }
             }
 
             const { error: deleteErr } = await supabase

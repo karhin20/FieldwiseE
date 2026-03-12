@@ -14,7 +14,10 @@ declare module "fastify" {
     }
 }
 
-const JWT_SECRET = process.env.JWT_SECRET || "";
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+    throw new Error("JWT_SECRET environment variable is required");
+}
 
 /**
  * Fastify preHandler hook — verifies JWT from Authorization header
@@ -31,7 +34,7 @@ export async function authenticate(
         }
 
         const token = authHeader.substring(7);
-        const decoded = jwt.verify(token, JWT_SECRET) as AuthUser;
+        const decoded = (jwt.verify(token, JWT_SECRET!) as unknown) as AuthUser;
 
         request.user = {
             id: decoded.id,

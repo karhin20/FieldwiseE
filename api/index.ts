@@ -2,6 +2,7 @@ import "dotenv/config";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
+import compress from "@fastify/compress";
 import { authRoutes } from "../src/routes/auth";
 import { reportRoutes } from "../src/routes/reports";
 import { storageRoutes } from "../src/routes/storage";
@@ -13,16 +14,27 @@ export function buildApp() {
         bodyLimit: 6 * 1024 * 1024, // 6MB max body (for base64 photo uploads)
     });
 
+    // Compression — reduces bandwidth usage (Vercel egress)
+    app.register(compress, { global: true });
+
     // Security headers
     app.register(helmet, {
-        contentSecurityPolicy: false, // Allow Vercel/browser dev tools
+        contentSecurityPolicy: {
+            directives: {
+                defaultSrc: ["'self'"],
+                scriptSrc: ["'self'", "'unsafe-inline'"],
+                styleSrc: ["'self'", "'unsafe-inline'"],
+                imgSrc: ["'self'", "data:", "https://*.supabase.co", "https://res.cloudinary.com"],
+                connectSrc: ["'self'", "https://*.supabase.co", "https://api.cloudinary.com", "https://res.cloudinary.com"],
+            },
+        },
     });
 
     // CORS — restrict to frontend origin
     const allowedOrigins = [
         process.env.FRONTEND_URL,
         "https://field-investigation-tracker.vercel.app",
-        "http://192.168.100.4:8080", // Local network access
+        // Local connections should use the FRONTEND_URL env var
     ].filter(Boolean) as string[];
 
     app.register(cors, {
@@ -36,7 +48,7 @@ export function buildApp() {
         },
         credentials: true,
         methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        allowedHeaders: ["Content-Type", "Authorization"],
+        allowedHeaders: ["Content-Type", "Authorization", "x-signup-secret"],
     });
 
     // Health check
@@ -49,12 +61,18 @@ export function buildApp() {
     app.register(reportRoutes);
     app.register(storageRoutes);
 
-    // Global error handler
     app.setErrorHandler((error: any, request, reply) => {
         app.log.error(error);
         const statusCode = error.statusCode || 500;
+
+        // Sanitize error message for production: hide internal details on 500s
+        const message = statusCode >= 500
+            ? "An unexpected internal server error occurred"
+            : error.message;
+
         reply.code(statusCode).send({
-            error: statusCode >= 500 ? "Internal server error" : error.message,
+            error: message,
+            ...(process.env.NODE_ENV === "development" ? { stack: error.stack } : {})
         });
     });
 
