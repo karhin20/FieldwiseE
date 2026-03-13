@@ -183,6 +183,52 @@ export async function transactionRoutes(app: FastifyInstance) {
             return reply.send({ message: "Transaction deleted successfully" });
         }
     );
+
+    /**
+     * PUT /api/transactions/:id
+     * Update an existing transaction (Admin/Manager only)
+     */
+    app.put(
+        "/api/transactions/:id",
+        { preHandler: [authenticate, requireRole("manager")] },
+        async (request, reply) => {
+            const { id } = request.params as { id: string };
+            const body = request.body as {
+                accountNumber: string;
+                accountName: string;
+                district: string;
+                transactionType: "charge" | "payment";
+                amount: number;
+                description?: string | null;
+            };
+
+            const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+            if (!uuidRegex.test(id)) {
+                return reply.code(400).send({ error: "Invalid transaction ID format" });
+            }
+
+            const { data, error } = await supabase
+                .from("customer_transactions")
+                .update({
+                    account_number: body.accountNumber,
+                    account_name: body.accountName,
+                    district: body.district,
+                    transaction_type: body.transactionType,
+                    amount: body.amount,
+                    description: body.description,
+                })
+                .eq("id", id)
+                .select()
+                .single();
+
+            if (error) {
+                console.error("Update transaction error:", error);
+                return reply.code(500).send({ error: "Failed to update transaction" });
+            }
+
+            return reply.send(formatTransaction(data));
+        }
+    );
 }
 
 function formatTransaction(row: any) {
