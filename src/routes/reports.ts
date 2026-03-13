@@ -75,11 +75,25 @@ export async function reportRoutes(app: FastifyInstance) {
             const limit = Math.min(100, Math.max(1, parseInt(query.limit || "50", 10) || 50));
             const offset = (page - 1) * limit;
 
-            // Only fetch fields needed for the list view to save bandwidth
+            // Optimized query: Select report fields and aggregate transaction sums
+            // Using a subquery for transactions to keep it efficient and avoid complex joins in the main select
             let dbQuery = supabase
                 .from("investigation_reports")
                 .select(
-                    "id, account_name, account_number, existing_service_category, irregularities, officer_name, district, created_at, action_taken, meter_replaced_or_new, photo_url",
+                    `
+                    id, 
+                    account_name, 
+                    account_number, 
+                    existing_service_category, 
+                    irregularities, 
+                    officer_name, 
+                    district, 
+                    created_at, 
+                    action_taken, 
+                    meter_replaced_or_new, 
+                    photo_url,
+                    customer_transactions(amount, transaction_type)
+                    `,
                     { count: "exact" }
                 )
                 .order("created_at", { ascending: false })
@@ -97,13 +111,35 @@ export async function reportRoutes(app: FastifyInstance) {
 
             const { data: reports, error, count } = await dbQuery;
 
-            if (error) {
-                console.error("Reports fetch error:", error);
-                return reply.code(500).send({ error: "Failed to fetch reports" });
+            const formattedReports = (reports || []).map((r: any) => {
+                const transactions = r.customer_transactions || [];
+                const totalCharges = transactions
+                    .filter((t: any) => t.transaction_type === "charge")
+                    .reduce((sum: number, t: any) => sum + Number(t.amount), 0);
+                const totalPayments = transactions
+                    .filter((t: any) => t.transaction_type === "payment")
+                    .reduce((sum: number, t: any) => sum + Number(t.amount), 0);
+
+                const report = formatReport(r);
+                return {
+                    ...report,
+                    totalFunds: totalCharges - totalPayments,
+                    hasFunds: transactions.length > 0
+                };
+            });
+
+            // Handle memory-based filtering for hasFunds since Supabase grouping/filtering on joined counts is tricky
+            // For production, we'd use an RPC or a database view for even better performance
+            let finalReports = formattedReports;
+            const hasFundsQuery = request.query as { hasFunds?: string };
+            if (hasFundsQuery.hasFunds === "true") {
+                finalReports = formattedReports.filter(r => r.hasFunds);
+            } else if (hasFundsQuery.hasFunds === "false") {
+                finalReports = formattedReports.filter(r => !r.hasFunds);
             }
 
             return reply.send({
-                reports: (reports || []).map(formatReport),
+                reports: finalReports,
                 pagination: {
                     page,
                     limit,
