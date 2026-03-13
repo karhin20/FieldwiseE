@@ -80,6 +80,7 @@ export async function transactionRoutes(app: FastifyInstance) {
                 search?: string;
                 period?: string;
                 date?: string;
+                referenceReportId?: string;
             };
 
             const page = Math.max(1, parseInt(query.page || "1", 10) || 1);
@@ -101,6 +102,9 @@ export async function transactionRoutes(app: FastifyInstance) {
             if (query.search) {
                 // Search by account number or name
                 dbQuery = dbQuery.or(`account_number.ilike.%${query.search}%,account_name.ilike.%${query.search}%`);
+            }
+            if (query.referenceReportId) {
+                dbQuery = dbQuery.eq("reference_report_id", query.referenceReportId);
             }
             if (query.period && query.period !== "all") {
                 const targetDateStr = query.date || new Date().toISOString();
@@ -155,12 +159,17 @@ export async function transactionRoutes(app: FastifyInstance) {
         "/api/transactions/stats",
         { preHandler: [authenticate, requireRole("manager")] },
         async (request, reply) => {
-            const query = request.query as { period?: string; date?: string };
+            const query = request.query as { period?: string; date?: string; district?: string };
             const period = query.period || 'all';
             const date = query.date || null;
+            const district = query.district || 'all';
 
-            // Call the optimized Postgres function with the period argument
-            const { data: stats, error } = await supabase.rpc("get_transaction_stats", { p_period: period, p_date: date });
+            // Call the optimized Postgres function with the period and district arguments
+            const { data: stats, error } = await supabase.rpc("get_transaction_stats", {
+                p_period: period,
+                p_date: date,
+                p_district: district
+            });
 
             if (error) {
                 console.error("Transactions stats RPC error:", error);
