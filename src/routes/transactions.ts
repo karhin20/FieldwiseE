@@ -62,6 +62,8 @@ export async function transactionRoutes(app: FastifyInstance) {
                 district?: string;
                 type?: string;
                 search?: string;
+                period?: string;
+                date?: string;
             };
 
             const page = Math.max(1, parseInt(query.page || "1", 10) || 1);
@@ -83,6 +85,31 @@ export async function transactionRoutes(app: FastifyInstance) {
             if (query.search) {
                 // Search by account number or name
                 dbQuery = dbQuery.or(`account_number.ilike.%${query.search}%,account_name.ilike.%${query.search}%`);
+            }
+            if (query.period && query.period !== "all") {
+                const targetDateStr = query.date || new Date().toISOString();
+                const targetDate = new Date(targetDateStr);
+                let startDate, endDate;
+
+                if (query.period === 'daily') {
+                    startDate = new Date(targetDate.setHours(0, 0, 0, 0));
+                    endDate = new Date(startDate.getTime() + 86400000);
+                } else if (query.period === 'weekly') {
+                    // Monday is the start of the week
+                    const day = targetDate.getDay();
+                    const diff = targetDate.getDate() - day + (day === 0 ? -6 : 1);
+                    startDate = new Date(targetDate.setDate(diff));
+                    startDate.setHours(0, 0, 0, 0);
+                    endDate = new Date(startDate.getTime() + 7 * 86400000);
+                } else if (query.period === 'monthly') {
+                    startDate = new Date(targetDate.getFullYear(), targetDate.getMonth(), 1);
+                    endDate = new Date(targetDate.getFullYear(), targetDate.getMonth() + 1, 1);
+                }
+
+                if (startDate && endDate) {
+                    dbQuery = dbQuery.gte("created_at", startDate.toISOString());
+                    dbQuery = dbQuery.lt("created_at", endDate.toISOString());
+                }
             }
 
             const { data: transactions, error, count } = await dbQuery;
@@ -112,8 +139,12 @@ export async function transactionRoutes(app: FastifyInstance) {
         "/api/transactions/stats",
         { preHandler: [authenticate, requireRole("manager")] },
         async (request, reply) => {
-            // Call the optimized Postgres function
-            const { data: stats, error } = await supabase.rpc("get_transaction_stats");
+            const query = request.query as { period?: string; date?: string };
+            const period = query.period || 'all';
+            const date = query.date || null;
+
+            // Call the optimized Postgres function with the period argument
+            const { data: stats, error } = await supabase.rpc("get_transaction_stats", { p_period: period, p_date: date });
 
             if (error) {
                 console.error("Transactions stats RPC error:", error);

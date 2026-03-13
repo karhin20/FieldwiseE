@@ -7,6 +7,7 @@ import { authRoutes } from "../src/routes/auth";
 import { reportRoutes } from "../src/routes/reports";
 import { storageRoutes } from "../src/routes/storage";
 import { transactionRoutes } from "../src/routes/transactions";
+import { accountRoutes } from "../src/routes/accounts";
 
 // Build the Fastify app
 export function buildApp() {
@@ -62,6 +63,7 @@ export function buildApp() {
     app.register(reportRoutes);
     app.register(storageRoutes);
     app.register(transactionRoutes);
+    app.register(accountRoutes);
 
     app.setErrorHandler((error: any, request, reply) => {
         app.log.error(error);
