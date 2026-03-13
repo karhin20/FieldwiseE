@@ -23,6 +23,22 @@ export async function transactionRoutes(app: FastifyInstance) {
             }
 
             const data = parsed.data;
+            let finalReportId = data.referenceReportId || null;
+
+            // Auto-link: If no report ID provided, find the latest report for this account
+            if (!finalReportId) {
+                const { data: latestReport } = await supabase
+                    .from("investigation_reports")
+                    .select("id")
+                    .eq("account_number", data.accountNumber)
+                    .order("created_at", { ascending: false })
+                    .limit(1)
+                    .single();
+
+                if (latestReport) {
+                    finalReportId = latestReport.id;
+                }
+            }
 
             const { data: transaction, error } = await supabase
                 .from("customer_transactions")
@@ -34,7 +50,7 @@ export async function transactionRoutes(app: FastifyInstance) {
                     transaction_type: data.transactionType,
                     amount: data.amount,
                     description: data.description || null,
-                    reference_report_id: data.referenceReportId || null,
+                    reference_report_id: finalReportId,
                 })
                 .select()
                 .single();
