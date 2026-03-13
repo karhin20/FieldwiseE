@@ -6,6 +6,7 @@ import compress from "@fastify/compress";
 import { authRoutes } from "../src/routes/auth";
 import { reportRoutes } from "../src/routes/reports";
 import { storageRoutes } from "../src/routes/storage";
+import { transactionRoutes } from "../src/routes/transactions";
 
 // Build the Fastify app
 export function buildApp() {
@@ -60,6 +61,7 @@ export function buildApp() {
     app.register(authRoutes);
     app.register(reportRoutes);
     app.register(storageRoutes);
+    app.register(transactionRoutes);
 
     app.setErrorHandler((error: any, request, reply) => {
         app.log.error(error);
